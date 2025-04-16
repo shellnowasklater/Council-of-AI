@@ -1,0 +1,148 @@
+import asyncio
+import json
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+import httpx
+import logging
+from pydantic import BaseModel
+from typing import List, Dict, Any
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="AI Council Server")
+
+# Configuration for our Ollama models
+MODELS = [
+    {"name": "llama3", "url": "http://localhost:11434/api/generate"},
+    {"name": "mistral", "url": "http://localhost:11434/api/generate"},
+    {"name": "gemma", "url": "http://localhost:11434/api/generate"},
+    {"name": "phi", "url": "http://localhost:11434/api/generate"},
+    {"name": "falcon", "url": "http://localhost:11434/api/generate"},
+    {"name": "tinyllama", "url": "http://localhost:11434/api/generate"},
+    {"name": "orca-mini", "url": "http://localhost:11434/api/generate"},
+    {"name": "stablelm", "url": "http://localhost:11434/api/generate"},
+]
+
+class QueryRequest(BaseModel):
+    query: str
+    council_summary: bool = True  # Whether to include a summary of all model responses
+    timeout: int = 60  # Timeout in seconds
+
+async def query_model(client: httpx.AsyncClient, model: Dict[str, str], query: str) -> Dict[str, Any]:
+    """Query a specific Ollama model and return its response."""
+    try:
+        model_name = model["name"]
+        prompt = f"""
+        You are {model_name}, a helpful AI assistant.
+        Please respond to the following query:
+        
+        {query}
+        
+        Provide your best answer based on your knowledge and capabilities.
+        """
+        
+        payload = {
+            "model": model_name,
+            "prompt": prompt,
+            "stream": False
+        }
+        
+        logger.info(f"Querying model {model_name}")
+        response = await client.post(model["url"], json=payload)
+        response.raise_for_status()
+        
+        result = response.json()
+        return {
+            "model": model_name,
+            "response": result.get("response", "No response generated"),
+            "success": True
+        }
+    except Exception as e:
+        logger.error(f"Error querying model {model['name']}: {str(e)}")
+        return {
+            "model": model["name"],
+            "response": f"Error: {str(e)}",
+            "success": False
+        }
+
+async def generate_council_summary(client: httpx.AsyncClient, query: str, responses: List[Dict[str, Any]]) -> str:
+    """Use one of the models to generate a summary of all responses."""
+    try:
+        # Use the first successful model to generate a summary
+        successful_models = [r for r in responses if r["success"]]
+        if not successful_models:
+            return "Unable to generate council summary as all models failed."
+        
+        summary_model = MODELS[0]  # Default to first model
+        
+        # Prepare the responses for the summary
+        response_text = "\n\n".join([
+            f"Model: {r['model']}\nResponse: {r['response']}" for r in responses
+        ])
+        
+        summary_prompt = f"""
+        You are a wise coordinator of an AI council. Below are responses from different AI models to this query:
+        
+        QUERY: {query}
+        
+        MODEL RESPONSES:
+        {response_text}
+        
+        Please synthesize these responses into a cohesive summary that captures the collective wisdom,
+        highlighting areas of agreement and noting any significant disagreements or unique insights.
+        Provide a final recommendation or answer based on the collective input.
+        """
+        
+        payload = {
+            "model": summary_model["name"],
+            "prompt": summary_prompt,
+            "stream": False
+        }
+        
+        logger.info(f"Generating council summary using {summary_model['name']}")
+        response = await client.post(summary_model["url"], json=payload)
+        response.raise_for_status()
+        
+        result = response.json()
+        return result.get("response", "Failed to generate summary")
+    except Exception as e:
+        logger.error(f"Error generating council summary: {str(e)}")
+        return f"Error generating council summary: {str(e)}"
+
+@app.post("/ask")
+async def ask_council(request: QueryRequest):
+    """Endpoint to ask a question to the council of models."""
+    try:
+        async with httpx.AsyncClient(timeout=request.timeout) as client:
+            # Query all models in parallel
+            tasks = [query_model(client, model, request.query) for model in MODELS]
+            responses = await asyncio.gather(*tasks)
+            
+            result = {
+                "query": request.query,
+                "model_responses": responses
+            }
+            
+            # Generate a summary if requested
+            if request.council_summary:
+                summary = await generate_council_summary(client, request.query, responses)
+                result["council_summary"] = summary
+                
+            return JSONResponse(content=result)
+    except Exception as e:
+        logger.error(f"Error processing request: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Error processing request: {str(e)}"}
+        )
+
+@app.get("/health")
+async def health_check():
+    """Simple health check endpoint."""
+    return {"status": "ok"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
